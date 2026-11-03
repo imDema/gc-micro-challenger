@@ -1,33 +1,37 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     string::FromUtf8Error,
     sync::{
-        atomic::{AtomicU32, Ordering},
         Arc,
+        atomic::{AtomicU32, Ordering},
     },
 };
 
+use bstr::BStr;
 use dashmap::DashMap;
-use fxhash::FxBuildHasher;
 use log::ResultLog;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use types::{BenchConfig, QueryId};
 
 pub mod cli;
+pub mod html;
 pub mod json;
 pub mod log;
-pub mod plot;
 pub mod types;
-pub mod html;
 
-const CONFIG: &'static str = "CONFIG";
-const BENCH: &'static str = "BENCH";
-const RESULT: &'static str = "RESULT";
-const INPUT: &'static str = "INPUT";
-const OUTPUT: &'static str = "OUTPUT";
-const META: &'static str = "META";
+const CONFIG: &str = "CONFIG";
+const BENCH: &str = "BENCH";
+const RESULT: &str = "RESULT";
+const INPUT: &str = "INPUT";
+const OUTPUT: &str = "OUTPUT";
+const META: &str = "META";
+
+const COL_EVENT_ID: usize = 1;
+const COL_EVENT_TYPE: usize = 2;
+
+const REQ_MAPPING_KEY: &str = "meta:request_mapping";
 
 #[derive(Clone)]
 pub struct Context {
@@ -35,20 +39,12 @@ pub struct Context {
     sessions: Arc<DashMap<String, Session>>,
 }
 
-pub fn output_key(id: QueryId, index: u32) -> impl AsRef<[u8]> {
-    let mut key = [0u8; 9];
-    key[0] = id;
-    key[1..9].swap_with_slice(&mut index.to_be_bytes());
-    key
-}
-
 pub fn input_key(index: u32) -> impl AsRef<[u8]> {
     index.to_be_bytes()
 }
 
-pub fn result_key(bench_id: &str, q: QueryId, index: u32) -> impl AsRef<[u8]> {
+pub fn result_key(bench_id: &str, index: u32) -> impl AsRef<[u8]> {
     let mut key = bench_id.as_bytes().to_vec();
-    key.extend(&q.to_be_bytes());
     key.extend(&index.to_be_bytes());
     key
 }
@@ -66,23 +62,20 @@ impl Context {
 
         let db = self.sled.open_tree(CONFIG)?;
         let conf = serde_json::to_vec(&config)?;
-        db.insert(&uuid.as_bytes(), conf)?;
+        db.insert(uuid.as_bytes(), conf)?;
 
         let max = match config.max_batches {
             Some(max) => max,
             None => get_meta(&self.sled, "count")?.expect("missing count variable in db metadata"),
         };
 
-        let logs = config
-            .queries
-            .into_iter()
-            .map(|q| (q, ResultLog::new(max as usize, num_cpus::get() * 8)))
-            .collect();
+        let logs = ResultLog::new(max as usize, num_cpus::get() * 8);
 
         let session = Session {
             index: 0.into(),
             end: max,
             logs,
+            query_indices: Default::default(),
         };
 
         self.sessions.insert(uuid.clone(), session);
@@ -90,10 +83,11 @@ impl Context {
         Ok(uuid)
     }
 
-    pub fn next_batch<'a>(&'a self, bench_id: &str) -> Result<Option<Vec<u8>>, Error> {
-        let session = self
+    /// Returns the next input CSV line and its event type (0=transaction, 1=query).
+    pub fn next_batch(&self, bench_id: &str) -> Result<Option<String>, Error> {
+        let mut session = self
             .sessions
-            .get(bench_id)
+            .get_mut(bench_id)
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?;
 
         let index = session.index.fetch_add(1, Ordering::Relaxed);
@@ -103,42 +97,38 @@ impl Context {
         }
 
         let db = self.sled.open_tree(INPUT)?;
-        let output = db.get(input_key(index))?.map(|v| v.to_vec());
+        let raw = db.get(input_key(index))?;
 
-        session.logs.values().for_each(|l| l.start(index as usize));
+        let line = match raw {
+            Some(v) => String::from_utf8(v.to_vec()).map_err(Error::from)?,
+            None => return Ok(None),
+        };
 
-        Ok(output)
+        // Parse event type from the first CSV field (0 or 1).
+        if let Some(request_id) = line.split(',').nth(1).and_then(|f| f.parse::<usize>().ok()) {
+            // Record the event type for all query logs.
+            session.logs.start(request_id);
+            session.query_indices.insert(index as usize);
+        }
+
+        Ok(Some(line))
     }
 
     pub fn result(
         &self,
         bench_id: &str,
-        query: QueryId,
-        batch_id: usize,
-        payload: Vec<u8>,
+        index: usize,
+        output_csv: String,
     ) -> Result<Option<OffsetDateTime>, Error> {
         let session = self
             .sessions
             .get(bench_id)
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?;
 
-        let log = session
-            .logs
-            .get(&query)
-            .ok_or_else(|| Error::InvalidQuery(query))?;
+        let log = &session.logs;
 
-        Ok(log.put(batch_id, payload))
-    }
-
-    pub fn get_result(
-        &self,
-        bench_id: &str,
-        query: QueryId,
-        batch_id: usize,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let tree = self.sled.open_tree(RESULT)?;
-        let res = tree.get(result_key(bench_id, query, batch_id as u32))?;
-        Ok(res.map(|x| x.to_vec()))
+        // Store result in the log only — persisted to SLED at completion.
+        Ok(log.put(index, output_csv.into_bytes()))
     }
 
     pub fn complete(&self, bench_id: &str) -> Result<Report, Error> {
@@ -148,65 +138,59 @@ impl Context {
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?
             .1;
 
-        let mut queries = HashMap::new();
-        for (q, log) in session.logs.into_iter() {
-            let timings = log.to_vec();
+        let mappings = get_meta::<HashMap<String, String>>(&self.sled, REQ_MAPPING_KEY)?
+            .unwrap_or_default();
 
-            let tree = self.sled.open_tree(RESULT)?;
-            for (i, result) in timings
-                .iter()
-                .enumerate()
-                .filter_map(|(i, x)| x.clone().map(|x| (i, x)))
-            {
-                tree.insert(result_key(bench_id, q, i as u32), result.data.as_ref())?;
+        tracing::info!("loaded mappings: {mappings:?}");
+
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        let output_log = session.logs;
+        let output_timings = output_log.to_completed_vec();
+
+
+        let result_tree = self.sled.open_tree(RESULT)?;
+        for (i, result) in output_timings.iter().enumerate() {
+            if let Some(r) = result {
+                let key = result_key(bench_id, i as u32);
+                result_tree.insert(key, r.data.as_ref())?;
             }
-
-            let count = timings.iter().rev().skip_while(|x| x.is_none()).count();
-            let missing = timings.iter().take(count).filter(|x| x.is_none()).count();
-            let mut latencies = timings
-                .iter()
-                .flatten()
-                .map(|x| (x.end - x.start))
-                .collect::<Vec<_>>();
-            latencies.sort_unstable();
-
-            let latency_mean = latencies.iter().sum::<time::Duration>() / count as f64;
-            let latency_min = latencies.first().cloned().unwrap_or_default();
-            let latency_max = latencies.last().cloned().unwrap_or_default();
-            let latency_p99 = latencies
-                .get((count as f64 * 0.99).ceil() as usize)
-                .cloned()
-                .unwrap_or_default();
-
-            let min_t = timings.iter().flatten().map(|r| r.start).min();
-            let max_t = timings.iter().flatten().map(|r| r.end).max();
-            let dt = min_t.zip(max_t).map(|(min, max)| max - min);
-            let throughput = count as f64 / dt.unwrap_or_default().as_seconds_f64();
-
-            queries.insert(
-                q as u8,
-                QueryReport {
-                    count,
-                    missing,
-                    timings: timings
-                        .into_iter()
-                        .map(|o| o.map(|x| x.end - x.start))
-                        .collect(),
-                    throughput,
-                    latency_mean,
-                    latency_min,
-                    latency_max,
-                    latency_p99,
-                },
-            );
         }
 
-        let conf = self.sled.open_tree(CONFIG)?.get(bench_id.as_bytes())?.expect("missing config for completed bench");
+        let conf = self
+            .sled
+            .open_tree(CONFIG)?
+            .get(bench_id.as_bytes())?
+            .ok_or_else(|| Error::InvalidId(bench_id.into()))?;
         let conf: BenchConfig = serde_json::from_slice(&conf)?;
+
+        let timings = compute_timings(
+            &self.sled,
+            bench_id,
+            output_timings.iter().map(Option::as_ref).enumerate().collect(),
+        )?;
+
+        // Group requests by track (mapping: request type -> track name).
+        let mut by_track: HashMap<String, Vec<(usize, Option<&log::CompleteResult>)>> = HashMap::new();
+        for (i, r) in output_timings.iter().enumerate() {
+            let Some(row) = r else { continue };
+            let track = extract_request_type(&row.data).and_then(|t| mappings.get(&t));
+            if let Some(track) = track {
+                by_track.entry(track.clone()).or_default().push((i, r.as_ref()));
+            }
+        }
+        let mut tracks = HashMap::new();
+        for (track, reqs) in by_track {
+            // Only report tracks with at least one answered request.
+            if reqs.iter().any(|(_, r)| r.is_some()) {
+                tracks.insert(track, compute_timings(&self.sled, bench_id, reqs)?);
+            }
+        }
 
         let r = Report {
             bench_id: bench_id.into(),
-            queries,
+            timings,
+            tracks,
             apitoken: conf.apitoken,
             bench_name: conf.name,
             test: conf.test,
@@ -223,7 +207,10 @@ impl Context {
         let removed = tree.remove(bench_id.as_bytes())?.is_some();
 
         let tree = self.sled.open_tree(RESULT)?;
-        let keys: Vec<_> = tree.scan_prefix(bench_id.as_bytes()).map(|e| e.unwrap().0).collect();
+        let keys: Vec<_> = tree
+            .scan_prefix(bench_id.as_bytes())
+            .map(|e| e.unwrap().0)
+            .collect();
         for k in keys {
             tree.remove(k)?;
         }
@@ -239,28 +226,119 @@ impl Context {
             .collect::<Result<HashMap<_, _>, Error>>()
     }
 
-    pub fn set_input(&self, query: QueryId, batch_id: u32, data: &[u8]) -> Result<(), Error> {
+    pub fn set_input(&self, batch_id: u32, data: &[u8]) -> Result<(), Error> {
         let tree = self.sled.open_tree(INPUT)?;
-        let key = output_key(query, batch_id);
-
-        tree.insert(&key, data)?;
+        tree.insert(batch_id.to_be_bytes(), data)?;
 
         Ok(())
     }
 
-    pub fn set_output(&self, query: QueryId, batch_id: u32, data: &[u8]) -> Result<(), Error> {
+    pub fn set_output(&self, batch_id: u32, data: &[u8]) -> Result<(), Error> {
         let tree = self.sled.open_tree(OUTPUT)?;
-        let key = output_key(query, batch_id);
-
-        tree.insert(&key, data)?;
+        tree.insert(batch_id.to_be_bytes(), data)?;
 
         Ok(())
     }
 }
 
+fn compute_timings(
+    db: &sled::Db,
+    bench_id: &str,
+    output_timings: Vec<(usize, Option<&log::CompleteResult>)>,
+) -> Result<TimingReport, Error> {
+    let output_tree = db.open_tree(OUTPUT)?;
+
+    let count = output_timings.len();
+    let (missing, correct) = output_timings
+        .iter()
+        .map(|&(i, result)| {
+            tracing::debug!("analyzing query output {i}");
+
+            let Some(result) = result else { return (1, 0) };
+
+            let Ok(Some(expected)) = output_tree.get(input_key(i as u32)) else {
+                tracing::error!("Missing entry in OUTPUT tree for {bench_id}, {i}");
+                return (0, 0);
+            };
+
+            let correct = result.data.as_ref() == expected.as_ref();
+
+            if !correct {
+                tracing::warn!(
+                    "mismatch in result {i}. Expected: `{}` got `{}`",
+                    BStr::new(expected.as_ref()),
+                    BStr::new(result.data.as_ref())
+                );
+            }
+
+            (0, correct as usize)
+        })
+        .fold((0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1));
+    let mut latencies: Vec<_> = output_timings
+        .iter()
+        .filter_map(|x| x.1)
+        .map(|r| r.end - r.start)
+        .collect();
+    latencies.sort_unstable();
+    let latency_mean = if count > 0 {
+        latencies.iter().sum::<time::Duration>() / count as f64
+    } else {
+        time::Duration::ZERO
+    };
+    let latency_min = latencies.first().cloned().unwrap_or_default();
+    let latency_max = latencies.last().cloned().unwrap_or_default();
+    let latency_p99 = latencies
+        .get((count as f64 * 0.99).ceil() as usize)
+        .cloned()
+        .unwrap_or_default();
+    let min_t = output_timings
+        .iter()
+        .filter_map(|x| x.1)
+        .map(|r| r.start)
+        .min();
+    let max_t = output_timings
+        .iter()
+        .filter_map(|x| x.1)
+        .map(|r| r.end)
+        .max();
+    let throughput = match min_t.zip(max_t) {
+        Some((min, max)) => {
+            let d = max - min;
+            let secs = d.as_seconds_f64();
+            if secs > 0.0 { count as f64 / secs } else { 0.0 }
+        }
+        None => 0.0,
+    };
+    let full_timings: Vec<_> = output_timings
+        .iter()
+        .map(|x| x.1.map(|r| r.end - r.start))
+        .collect();
+    tracing::warn!("TODO: add input counts");
+
+    Ok(TimingReport {
+        count,
+        missing,
+        correct,
+        timings: full_timings,
+        throughput,
+        latency_mean,
+        latency_min,
+        latency_max,
+        latency_p99,
+    })
+}
+
+fn extract_request_type(row: &[u8]) -> Option<String> {
+    str::from_utf8(row)
+        .ok()?
+        .split(',')
+        .nth(COL_EVENT_TYPE)
+        .map(|t| t.trim().to_owned())
+}
+
 pub(crate) fn set_meta<T: Serialize>(sled: &sled::Db, key: &str, value: T) -> Result<(), Error> {
     let db = sled.open_tree(META)?;
-    let ser = rmp_serde::to_vec(&value).unwrap();
+    let ser = serde_json::to_vec(&value)?;
     db.insert(key.as_bytes(), ser)?;
     Ok(())
 }
@@ -271,14 +349,18 @@ pub(crate) fn get_meta<T: for<'de> Deserialize<'de>>(
 ) -> Result<Option<T>, Error> {
     let db = sled.open_tree(META)?;
     let ser = db.get(key.as_bytes())?;
-    let value = ser.map(|data| rmp_serde::from_slice(&data).unwrap());
+    let value = ser
+        .map(|data| serde_json::from_slice(&data).map_err(Error::from))
+        .transpose()?;
     Ok(value)
 }
 
 struct Session {
     index: AtomicU32,
     end: u32,
-    logs: HashMap<QueryId, ResultLog, FxBuildHasher>,
+    logs: ResultLog,
+    /// Which indices are query events (need a response).
+    query_indices: HashSet<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -287,13 +369,15 @@ pub struct Report {
     pub bench_id: String,
     pub bench_name: String,
     pub test: bool,
-    pub queries: HashMap<QueryId, QueryReport>,
+    pub timings: TimingReport,
+    pub tracks: HashMap<String, TimingReport>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct QueryReport {
+pub struct TimingReport {
     pub count: usize,
     pub missing: usize,
+    pub correct: usize,
     pub timings: Vec<Option<Duration>>,
     pub throughput: f64,
     pub latency_mean: Duration,
@@ -319,6 +403,223 @@ pub enum Error {
     #[error("Invalid query `{0}`")]
     InvalidQuery(u8),
 
-    #[error("Invalid chacracters in string {0}")]
+    #[error("Invalid characters in string {0}")]
     InvalidUtf8(#[from] FromUtf8Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_ctx() -> (tempfile::TempDir, Context) {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::new(&dir.path().join("data")).unwrap();
+        (dir, ctx)
+    }
+
+    fn new_bench(ctx: &Context, max_batches: u32) -> String {
+        ctx.create(BenchConfig {
+            apitoken: "test".into(),
+            name: "test".into(),
+            test: true,
+            max_batches: Some(max_batches),
+        })
+        .unwrap()
+    }
+
+    // --- ResultLog tests ---
+
+    #[test]
+    fn result_log_only_started_entries_are_reported() {
+        let log = ResultLog::new(10, 4);
+        log.start(0);
+        log.start(1);
+        log.put(1, b"data1".to_vec());
+        log.put(2, b"not started".to_vec()); // ignored
+
+        let results = log.to_completed_vec();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_none());
+        assert_eq!(results[1].as_ref().unwrap().data.as_ref(), b"data1");
+    }
+
+    #[test]
+    fn result_log_uses_correct_timestamps() {
+        let log = ResultLog::new(10, 4);
+        log.start(0);
+        let start_ts = OffsetDateTime::now_utc();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        log.put(0, b"data".to_vec());
+        let end_ts = OffsetDateTime::now_utc();
+
+        let results = log.to_completed_vec();
+        let r = results[0].as_ref().unwrap();
+        assert!(r.start <= start_ts, "start should be before mid-point");
+        assert!(r.end >= start_ts, "end should be after mid-point");
+        assert!(r.end <= end_ts, "end should be before or at end_ts");
+        assert!(r.end > r.start, "end must be after start");
+    }
+
+    #[test]
+    fn result_log_missing_result() {
+        let log = ResultLog::new(10, 4);
+        log.start(0);
+        // Don't put a result for index 0
+        let results = log.to_completed_vec();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_none());
+    }
+
+    // --- Full flow tests ---
+
+    #[test]
+    fn next_batch_registers_only_query_events() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 4);
+
+        // 2 transactions, 2 queries
+        ctx.set_input(0, b"2025-01-01T00:00:01Z,,,,tx1,,").unwrap();
+        ctx.set_input(1, b"2025-01-01T00:00:05Z,0,BALANCE,address=A,,,")
+            .unwrap();
+        ctx.set_input(2, b"2025-01-01T00:00:03Z,,,,tx2,,").unwrap();
+        ctx.set_input(3, b"2025-01-01T00:00:06Z,1,BALANCE,address=A,,,")
+            .unwrap();
+
+        for _ in 0..4 {
+            ctx.next_batch(&bench_id).unwrap();
+        }
+        // Answer only request 0
+        ctx.result(&bench_id, 0, "2025-01-01T00:00:03Z,0,DUMMY,{}".into())
+            .unwrap();
+
+        let report = ctx.complete(&bench_id).unwrap();
+        let q = report.tracks.get(&0).unwrap();
+        // Transactions are not logged, so they are not "missing"; only request 1 is
+        assert_eq!(q.missing, 1);
+        assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 1);
+        assert_eq!(q.count, 1);
+    }
+
+    #[test]
+    fn full_benchmark_flow() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 5);
+
+        let input_lines = vec![
+            "2025-01-01T00:00:01Z,,,,tx1,,",
+            "2025-01-01T00:00:05Z,0,BALANCE,address=A,,,",
+            "2025-01-01T00:00:03Z,,,,tx2,,",
+            "2025-01-01T00:00:06Z,1,BALANCE,address=A,,,",
+            "2025-01-01T00:00:05Z,,,,tx3,,",
+        ];
+        for (i, line) in input_lines.iter().enumerate() {
+            ctx.set_input(i as u32, line.as_bytes()).unwrap();
+        }
+
+        let mut query_responses = 0;
+        for _ in 0..5 {
+            let line = ctx.next_batch(&bench_id).unwrap().unwrap();
+            if !line.split(',').nth(1).unwrap().is_empty() {
+                let request_id: usize = line.split(',').nth(1).unwrap().parse().unwrap();
+                let output = "2025-01-01T00:00:05Z,0,DUMMY,{\"result\":42}".to_string();
+                ctx.result(&bench_id, request_id, output).unwrap();
+                query_responses += 1;
+            }
+        }
+        assert_eq!(query_responses, 2);
+
+        let report = ctx.complete(&bench_id).unwrap();
+        let q = report.tracks.get(&0).unwrap();
+        assert_eq!(q.missing, 0);
+        assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 2);
+        assert_eq!(q.count, 2);
+    }
+
+    #[test]
+    fn query_only_metrics_filtered() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 4);
+
+        // 2 transactions, 2 queries
+        let inputs = vec![
+            "2025-01-01T00:00:01Z,,,,tx1,,",
+            "2025-01-01T00:00:05Z,0,BALANCE,address=A,,,",
+            "2025-01-01T00:00:03Z,,,,tx2,,",
+            "2025-01-01T00:00:06Z,1,BALANCE,address=A,,,",
+        ];
+        for (i, line) in inputs.iter().enumerate() {
+            ctx.set_input(i as u32, line.as_bytes()).unwrap();
+        }
+
+        // Process all 4 events, respond only to query at index 1
+        for _ in 0..4 {
+            ctx.next_batch(&bench_id).unwrap();
+        }
+        ctx.result(
+            &bench_id,
+            0,
+            "2025-01-01T00:00:03Z,0,DUMMY,{\"x\":1}".into(),
+        )
+        .unwrap();
+
+        let report = ctx.complete(&bench_id).unwrap();
+        let q = report.tracks.get(&0).unwrap();
+        // 1 completed query (index 1), 1 query without response (index 3)
+        assert_eq!(q.missing, 1);
+        assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn correct_counts_matching_expected_output() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 2);
+
+        ctx.set_input(0, b"2025-01-01T00:00:01Z,,,,tx1,,").unwrap();
+        ctx.set_input(1, b"2025-01-01T00:00:05Z,0,BALANCE,address=A,,,")
+            .unwrap();
+        ctx.set_output(0, b"unused").unwrap(); // not a query key, must be ignored
+        ctx.sled
+            .open_tree(OUTPUT)
+            .unwrap()
+            .insert(result_key(&bench_id, 0), b"expected")
+            .unwrap();
+
+        for _ in 0..2 {
+            ctx.next_batch(&bench_id).unwrap();
+        }
+        ctx.result(&bench_id, 0, "expected".into()).unwrap();
+
+        let report = ctx.complete(&bench_id).unwrap();
+        let q = report.tracks.get(&0).unwrap();
+        assert_eq!(q.correct, 1);
+        assert_eq!(q.missing, 0);
+    }
+
+    #[test]
+    fn set_input_uses_batch_id_as_key() {
+        let (_dir, ctx) = temp_ctx();
+
+        ctx.set_input(42, b"test-data").unwrap();
+        let tree = ctx.sled.open_tree(INPUT).unwrap();
+        assert_eq!(
+            tree.get(42u32.to_be_bytes()).unwrap().map(|v| v.to_vec()),
+            Some(b"test-data".to_vec())
+        );
+
+        // Verify set_input overwrites
+        ctx.set_input(42, b"overwritten").unwrap();
+        assert_eq!(
+            tree.get(42u32.to_be_bytes()).unwrap().map(|v| v.to_vec()),
+            Some(b"overwritten".to_vec())
+        );
+    }
+
+    #[test]
+    fn next_batch_returns_none_at_end() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 1);
+
+        // No input loaded — first batch returns None
+        assert!(ctx.next_batch(&bench_id).unwrap().is_none());
+    }
 }

@@ -1,4 +1,10 @@
+.vscode
+
 /target
+
 /results
 /data
-.vscode
+
+
+tracks.json
+*.csv

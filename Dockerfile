@@ -1,5 +1,5 @@
 # BUILDER
-FROM rust:1.86-slim-bookworm AS builder
+FROM rust:1.100-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install build-essential clang pkg-config libfreetype6-dev libfontconfig1-dev  -y 
 

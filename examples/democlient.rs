@@ -1,9 +1,61 @@
 use clap::Parser;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 
 #[derive(Parser)]
 struct Options {
     endpoint: String,
+}
+
+// event_time,request_id,request_type,params,tx_id,spends,creates
+
+// event_time,request_id,request_type,result
+
+async fn process_batch(client: Client, url: &str, id: &str, i: usize) -> eyre::Result<bool> {
+    tracing::debug!("getting event {i}");
+    let resp = client
+        .get(format!("{url}/api/next_batch/{id}"))
+        .send()
+        .await?
+        .error_for_status();
+
+    let line = match resp {
+        Ok(r) => r.text().await?,
+        Err(e) if e.status() == Some(StatusCode::NOT_FOUND) => {
+            tracing::info!("Next batch not found, breaking...");
+            return Ok(false);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    // Extract event type from the first CSV field (0 or 1).
+    let is_query = line
+        .split(',')
+        .nth(1) // request_id field
+        .and_then(|f| f.parse::<u64>().ok())
+        .is_some();
+    tracing::debug!("event {i}: query={is_query}");
+    // tracing::debug!("{}", &line[..30.min(line.len())]);
+
+    // Only send a result for query events.
+    if is_query {
+        // Build a CSV output line: request_id,event_time,request_type,result
+        // Extract request_id from the input line (5th column, 0-indexed 4).
+        let event_time = line.split(',').nth(0).unwrap().trim();
+        let request_id = line.split(',').nth(1).unwrap().trim();
+        let request_type = line.split(',').nth(2).unwrap().trim();
+        let output_line = format!("{event_time},{request_id},{request_type},dummy:response;");
+
+        client
+            .post(format!("{url}/api/result/{id}/{request_id}"))
+            .body(output_line)
+            .send()
+            .await?
+            .error_for_status()?;
+        tracing::info!("sent result for event {i}");
+    } else {
+        tracing::debug!("event {i} is an input only event, skipping response");
+    }
+    Ok(true)
 }
 
 #[tokio::main]
@@ -14,46 +66,42 @@ async fn main() -> eyre::Result<()> {
     let url = opts.endpoint;
 
     tracing::info!("starting demo client");
-    let id = client
+
+    // Create benchmark.
+    let id: String = client
         .post(format!("{url}/api/create"))
-        .json(&serde_json::json!({"apitoken": "pepega","test": true,"queries": [0],"max_batches": 20}))
+        .json(&serde_json::json!({
+            "apitoken": "pepega",
+            "test": true,
+            "queries": [0],
+            // "max_batches": 20
+        }))
         .send()
         .await?
         .error_for_status()?
-        .json::<String>()
+        .json()
         .await?;
     tracing::info!("created bench {id}");
 
-    assert!(dbg!{client
+    // Start benchmark.
+    client
         .post(format!("{url}/api/start/{id}"))
         .send()
-        .await?}
-        .status()
-        .is_success());
+        .await?
+        .error_for_status()?;
     tracing::info!("started bench {id}");
 
-    for i in 0..20 {
-        tracing::info!("getting batch {i}");
-        let input = client
-            .post(format!("{url}/api/next_batch/{id}"))
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+    // Process batches.
+    let i = 0;
+    let mut active = true;
 
-        tracing::debug!("{input}");
-        tracing::info!("sending batch {i}");
-        assert!(client
-            .post(format!("{url}/api/result/0/{id}/{i}"))
-            .body(input)
-            .send()
-            .await?
-            .status()
-            .is_success());
+    while active {
+        tracing::info!("getting event {i}");
+        active = process_batch(client.clone(), &url, &id, i).await?;
     }
 
-    let result = client
+    // End benchmark and get report.
+    let result: String = client
         .post(format!("{url}/api/end/{id}"))
         .send()
         .await?
@@ -62,7 +110,7 @@ async fn main() -> eyre::Result<()> {
         .await?;
     tracing::info!("completed bench {id}");
 
-    println!("result: {result}");
+    println!("{result}");
 
     Ok(())
 }

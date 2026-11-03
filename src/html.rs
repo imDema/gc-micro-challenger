@@ -1,8 +1,8 @@
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::{
+    Router,
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use rust_embed::Embed;
 
