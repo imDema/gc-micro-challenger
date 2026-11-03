@@ -1,0 +1,16 @@
+/target
+/*/target
+/tests
+.env
+.vscode
+.cargo
+
+Dockerfile
+Makefile
+.gitignore
+.dockerignore
+openapi.yml
+
+/*.sh
+/*.tar
+/*.tgz

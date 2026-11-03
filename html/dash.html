@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVG Chart Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 0;
+        }
+        .history-table-wrapper {
+            width: 100%;
+            max-width: 1200px;
+            overflow-x: auto;
+            margin: 20px auto;
+        }
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .history-table th, .history-table td {
+            border: 1px solid #ccc;
+            padding: 8px;
+            text-align: left;
+        }
+        .history-table th {
+            background-color: #f4f4f4;
+        }
+        .id-textbox {
+            width: 26ch;
+        }
+        .container {
+            display: flex;
+            justify-content: space-around;
+            width: 100%;
+            max-width: 1200px;
+            margin-top: 20px;
+        }
+        .column {
+            width: 45%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        svg {
+            border: 1px solid #ccc;
+            width: 100%;
+            height: 100%;
+        }
+        .controls {
+            margin-bottom: 10px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>History</h1>
+    <div class="table-wrapper">
+        <table class="history-table" id="historyTable">
+            <thead>
+                <tr>
+                    <th>Bench ID</th>
+                    <th>User ID</th>
+                    <th>Bench Name</th>
+                    <th>Query ID</th>
+                    <th>Count</th>
+                    <th>Missing</th>
+                    <th>Throughput</th>
+                    <th>Latency Mean</th>
+                    <th>Latency P99</th>
+                    <th>Latency Max</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+    <button id="refreshHistory">Refresh History</button>
+    <h2>Visualization</h2>
+    <div class="controls">
+        <label>
+            Sequence Number:
+            <input type="number" id="sequenceNumber" value="0" min="0" />
+        </label>
+    </div>
+    <div class="container">
+        <div class="column">
+            <div class="controls">
+                <label>
+                    Experiment ID:
+                    <input type="text" class="id-textbox" id="experiment1" value=""/>
+                </label>
+            </div>
+            <div id="chart1"></div>
+        </div>
+        <div class="column">
+            <div class="controls">
+                <label>
+                    Experiment ID:
+                    <input type="text" class="id-textbox" id="experiment2" value="" />
+                </label>
+            </div>
+            <div id="chart2"></div>
+        </div>
+    </div>
+    <script>
+        async function fetchSVG(experimentId, sequenceNumber, targetId) {
+            try {
+                const response = await fetch(`/api/plot/0/${experimentId}/${sequenceNumber}`);
+                if (response.ok) {
+                    const svg = await response.text();
+                    document.getElementById(targetId).innerHTML = svg;
+                } else {
+                    document.getElementById(targetId).innerHTML = '<p>Error loading SVG</p>';
+                }
+            } catch (error) {
+                document.getElementById(targetId).innerHTML = '<p>Network error</p>';
+            }
+        }
+
+        async function fetchHistory() {
+            try {
+                const response = await fetch('/api/history');
+                if (response.ok) {
+                    const data = await response.json();
+                    const tableBody = document.querySelector('#historyTable tbody');
+                    tableBody.innerHTML = '';
+                    data.forEach(row => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${row.bench_id}</td>
+                            <td>${row.apitoken}</td>
+                            <td>${row.bench_name}</td>
+                            <td>${row.query_id}</td>
+                            <td>${row.count}</td>
+                            <td>${row.missing}</td>
+                            <td>${row.throughput}</td>
+                            <td>${row.latency_mean}</td>
+                            <td>${row.latency_p99}</td>
+                            <td>${row.latency_max}</td>
+                        `;
+                        tableBody.appendChild(tr);
+                    });
+                } else {
+                    console.error('Failed to fetch history data');
+                }
+            } catch (error) {
+                console.error('Error fetching history:', error);
+            }
+        }
+
+        function updateCharts() {
+            const sequenceNumber = document.getElementById("sequenceNumber").value;
+            const experiment1 = document.getElementById("experiment1").value;
+            const experiment2 = document.getElementById("experiment2").value;
+
+            fetchSVG(experiment1, sequenceNumber, "chart1");
+            fetchSVG(experiment2, sequenceNumber, "chart2");
+        }
+
+        document.getElementById("sequenceNumber").addEventListener("input", () => {
+            if (document.getElementById("lockSequence").checked) {
+                updateCharts();
+            }
+        });
+
+        document.getElementById("experiment1").addEventListener("input", updateCharts);
+        document.getElementById("experiment2").addEventListener("input", updateCharts);
+        document.getElementById("sequenceNumber").addEventListener("input", updateCharts);
+        document.getElementById("refreshHistory").addEventListener("click", fetchHistory);
+
+        // Initial load
+        fetchHistory();
+        updateCharts();
+    </script>
+</body>
+</html>
