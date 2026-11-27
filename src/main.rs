@@ -120,7 +120,7 @@ fn list_results(ctx: &Context) {
 
 fn csv_results(ctx: &Context) {
     println!(
-        "bench_id,bench_name,query_id,count,missing,throughput,latency_mean,latency_min,latency_max,latency_p99"
+        "bench_id,bench_name,query_id,count,missing,correct,wrong,throughput,latency_mean,latency_min,latency_max,latency_p99"
     );
     for (bench_id, report) in ctx.history().expect("failed to fetch history").into_iter() {
         let bench_name = report.bench_name;
@@ -128,6 +128,8 @@ fn csv_results(ctx: &Context) {
             let micro_challenger::TimingReport {
                 count,
                 missing,
+                correct,
+                wrong,
                 throughput,
                 latency_mean,
                 latency_min,
@@ -137,7 +139,7 @@ fn csv_results(ctx: &Context) {
             } = qr;
 
             println!(
-                "{bench_id},{bench_name},{query_id},{count},{missing},{throughput},{latency_mean},{latency_min},{latency_max},{latency_p99}",
+                "{bench_id},{bench_name},{query_id},{count},{missing},{correct},{wrong},{throughput},{latency_mean},{latency_min},{latency_max},{latency_p99}",
             );
         }
     }

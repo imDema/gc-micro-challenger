@@ -1,38 +1,92 @@
-# DEBS'25 Grand Challenge local challenger
+# Micro challenger
 
-This is the local evaluation platform for the DEBS 2025 Grand Challenge.
+Local evaluation platform for the stream-processing challenge. It serves an input
+event stream over a REST API, receives the answers, and reports correctness and
+timings, overall and per track.
 
-The challenger is executed as a Docker container that binds to a local port.
+It supports starting benchmark runs, fetching input batches, submitting results and
+recording the timings. The `/dash` endpoint is used to browse previous runs.
 
-You can start benchmark runs, receive input batches, submit results and record
-the timings of the test. Additionally you can consult your previous runs and
-generate simple visualizations to check the correctness of your solution.
+## Data format
 
-## Running
+Input CSV (`event_time,request_id,request_type,params,tx_id,spends,creates`):
+- events with an empty `request_id` are transactions: they only update state and need no answer;
+- events with a numeric `request_id` are requests: each one needs an answer.
 
-1. Extract the two archives
-    - `gc27-chall.tgz`: contains all the required files excluding the database
-    - `gc27-chall-data.tgz`: contains the database with the inputs
+Output CSV (`event_time,request_id,request_type,result`) holds the expected answer
+for every request.
 
-    > Note: this guide expects the two archives to be extracted in the same directory
+## Loading the data
 
-2. Load and run the container
-    - See the `run.sh` script for the commands required to load the image and run it
+The challenger uses an embedded database, stored in a local directory (`data/db` below).
+No external database server is needed. The database must be built once from the two CSV
+files, and is then reused by every run.
 
-## Usage
+1. Build the database. The bind address is required by the CLI but unused in this
+   step, and the process exits when loading ends:
 
-The docker file contains a web server with a REST interface.
-In the archive you will find both an example unoptimized python solution and an openapi.yml specification.
+   ```
+   micro-challenger --load-csv-input input.csv --load-csv-output output.csv \
+       --max-batch-size 1024 127.0.0.1:0 data/db
+   ```
 
-The example client `client_ref.py` shows an example of how to use the local challenger, the `openapi.yml` contains the OpenAPI3/Swagger specification for the REST API, you can use it as reference to develop your solution. Note however that at the current time the API is not stable yet, we do not expect large changes, but this should be kept into consideration.
+2. Start the server on it:
 
-Finally, the webserver has a `/dash` http endpoint that can be used to browse the results of the benchmarking runs and plot the submitted results.
-> Note that you must send the `/api/end/{bench_id}` POST request for results to be available in the dash
+   ```
+   micro-challenger 127.0.0.1:8866 data/db
+   ```
 
-The `run.sh` script is configured to bind local port 8866. Example: `http://127.0.0.1:8866/api/create`
+Loading again into an existing directory adds to its content: remove the directory to
+start from scratch.
 
----
+- Consecutive transactions are grouped in batches of at most `--max-batch-size`
+  lines. Each request is always a batch of its own.
+- A batch is returned as several newline-separated CSV lines. Clients have to split
+  it and process every line.
 
-# Contact
+### Tracks
 
-Be sure to send us an email if you encounter problems.
+Requests can be split in tracks. Load a JSON map from `request_type` to track name
+(for example `{"BALANCE": "basic", "TOPK": "ranking"}`):
+
+```
+micro-challenger --load-request-mapping tracks.json 127.0.0.1:0 data/db
+```
+
+It can be combined with the CSV load. Requests whose type is not in the map are
+included only in the overall statistics.
+
+## REST API
+
+All endpoints are under `/api`.
+
+| Endpoint | Description |
+|---|---|
+| `POST /create` | Create a benchmark, returns its id. Body: `{"apitoken", "test", "name"?, "max_batches"?}` |
+| `POST /start/{bench-id}` | Start the benchmark |
+| `GET /next_batch/{bench-id}` | Next batch of input lines; `404` when the input is finished |
+| `POST /result/{bench-id}/{request-id}` | Submit the answer (an output CSV line) for a request |
+| `POST /end/{bench-id}` | Finish the run and get the report |
+| `GET /history` | Summary of previous runs, one entry per track |
+
+`/end` returns `{"overall": {...}, "tracks": {"<track>": {...}}}`. A track appears
+only if at least one of its requests was answered. Each stats object has:
+
+- `count`: number of requests (not events), answered or not
+- `missing`: requests without an answer, including requests never fetched
+- `correct` / `wrong`: answers equal to / different from the expected output
+- `throughput`: answered requests per second, from the first input batch sent until the last answer received
+- `latency_mean`, `latency_min`, `latency_max`, `latency_p99`: over answered requests,
+  from the moment the request is handed out until its answer arrives
+
+`/api/end/{bench-id}` must be called for the results to be saved and shown in `/dash`.
+
+The examples in `examples/` (`democlient`, `democlient-par`) show a complete client.
+
+## Other options
+
+- `--list-results`, `--csv-results`: print stored runs
+- `--delete-result <bench-id>`: remove a stored run
+
+`just run`, `just demo` and `just all` (see `Justfile`) build and run the server
+and a demo client.

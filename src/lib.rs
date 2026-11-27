@@ -3,7 +3,7 @@ use std::{
     path::Path,
     string::FromUtf8Error,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
     },
 };
@@ -76,6 +76,7 @@ impl Context {
             end: max,
             logs,
             query_indices: Default::default(),
+            start_time: Default::default(),
         };
 
         self.sessions.insert(uuid.clone(), session);
@@ -95,6 +96,8 @@ impl Context {
         if index >= session.end {
             return Ok(None);
         }
+
+        session.start_time.get_or_init(OffsetDateTime::now_utc);
 
         let db = self.sled.open_tree(INPUT)?;
         let raw = db.get(input_key(index))?;
@@ -138,7 +141,6 @@ impl Context {
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?
             .1;
 
-        let end = session.end;
         let mappings =
             get_meta::<HashMap<String, String>>(&self.sled, REQ_MAPPING_KEY)?.unwrap_or_default();
         let output_timings = session.logs.to_completed_vec();
@@ -158,39 +160,45 @@ impl Context {
             .ok_or_else(|| Error::InvalidId(bench_id.into()))?;
         let conf: BenchConfig = serde_json::from_slice(&conf)?;
 
-        let timings = compute_timings(
-            &self.sled,
-            bench_id,
-            output_timings
-                .iter()
-                .map(Option::as_ref)
-                .enumerate()
-                .collect(),
-        )?;
-
-        // Group every request in the input by track (mapping: request type -> track), so
-        // unanswered requests are included too. Rows are batches of newline-separated lines.
+        // Every request in the input (not every event), so unanswered ones are included.
+        // Also grouped by track (mapping: request type -> track). Rows are batches of
+        // newline-separated lines.
+        let mut all = Vec::new();
         let mut by_track: HashMap<&String, Vec<_>> = HashMap::new();
-        if !mappings.is_empty() {
-            let range = input_key(0).as_ref().to_vec()..input_key(end).as_ref().to_vec();
-            for batch in self.sled.open_tree(INPUT)?.range(range).values() {
-                for line in batch?.split(|&b| b == b'\n') {
-                    let id = csv_col(line, COL_EVENT_ID).and_then(|c| c.parse::<usize>().ok());
-                    let track = csv_col(line, COL_EVENT_TYPE).and_then(|t| mappings.get(t));
-                    if let (Some(id), Some(track)) = (id, track) {
-                        let answer = output_timings.get(id).and_then(Option::as_ref);
-                        by_track.entry(track).or_default().push((id, answer));
-                    }
+        let range = 0u32.to_be_bytes()..session.end.to_be_bytes();
+        for batch in self.sled.open_tree(INPUT)?.range(range).values() {
+            for line in batch?.split(|&b| b == b'\n') {
+                let Some(id) = csv_col(line, COL_EVENT_ID).and_then(|c| c.parse::<usize>().ok())
+                else {
+                    continue; // transaction
+                };
+                let req = (id, output_timings.get(id).and_then(Option::as_ref));
+                all.push(req);
+                if let Some(track) = csv_col(line, COL_EVENT_TYPE).and_then(|t| mappings.get(t)) {
+                    by_track.entry(track).or_default().push(req);
                 }
             }
         }
-        let mut tracks = HashMap::new();
-        for (track, reqs) in by_track {
-            // Only report tracks with at least one answered request.
-            if reqs.iter().any(|(_, a)| a.is_some()) {
-                tracks.insert(track.clone(), compute_timings(&self.sled, bench_id, reqs)?);
-            }
-        }
+
+        // Throughput window: first input event sent until the last result received.
+        let last_end = output_timings.iter().flatten().map(|r| r.end).max();
+        let run_duration = session
+            .start_time
+            .get()
+            .zip(last_end)
+            .map(|(a, b)| b - *a)
+            .unwrap_or_default();
+
+        let timings = compute_timings(&self.sled, bench_id, all, run_duration)?;
+        // Only report tracks with at least one answered request.
+        let tracks = by_track
+            .into_iter()
+            .filter(|(_, reqs)| reqs.iter().any(|(_, a)| a.is_some()))
+            .map(|(track, reqs)| {
+                let t = compute_timings(&self.sled, bench_id, reqs, run_duration)?;
+                Ok((track.clone(), t))
+            })
+            .collect::<Result<HashMap<_, _>, Error>>()?;
 
         let r = Report {
             bench_id: bench_id.into(),
@@ -250,20 +258,23 @@ fn compute_timings(
     db: &sled::Db,
     bench_id: &str,
     output_timings: Vec<(usize, Option<&log::CompleteResult>)>,
+    run_duration: Duration,
 ) -> Result<TimingReport, Error> {
     let output_tree = db.open_tree(OUTPUT)?;
 
     let count = output_timings.len();
-    let (missing, correct) = output_timings
+    let (missing, correct, wrong) = output_timings
         .iter()
         .map(|&(i, result)| {
             tracing::debug!("analyzing query output {i}");
 
-            let Some(result) = result else { return (1, 0) };
+            let Some(result) = result else {
+                return (1, 0, 0);
+            };
 
             let Ok(Some(expected)) = output_tree.get(input_key(i as u32)) else {
                 tracing::error!("Missing entry in OUTPUT tree for {bench_id}, {i}");
-                return (0, 0);
+                return (0, 0, 0);
             };
 
             let correct = result.data.as_ref() == expected.as_ref();
@@ -276,9 +287,9 @@ fn compute_timings(
                 );
             }
 
-            (0, correct as usize)
+            (0, correct as usize, !correct as usize)
         })
-        .fold((0, 0), |acc, x| (acc.0 + x.0, acc.1 + x.1));
+        .fold((0, 0, 0), |a, x| (a.0 + x.0, a.1 + x.1, a.2 + x.2));
     let mut latencies: Vec<_> = output_timings
         .iter()
         .filter_map(|x| x.1)
@@ -297,27 +308,10 @@ fn compute_timings(
         .get(((answered as f64 * 0.99).ceil() as usize).saturating_sub(1))
         .cloned()
         .unwrap_or_default();
-    let min_t = output_timings
-        .iter()
-        .filter_map(|x| x.1)
-        .map(|r| r.start)
-        .min();
-    let max_t = output_timings
-        .iter()
-        .filter_map(|x| x.1)
-        .map(|r| r.end)
-        .max();
-    let throughput = match min_t.zip(max_t) {
-        Some((min, max)) => {
-            let d = max - min;
-            let secs = d.as_seconds_f64();
-            if secs > 0.0 {
-                answered as f64 / secs
-            } else {
-                0.0
-            }
-        }
-        None => 0.0,
+    let throughput = if !run_duration.is_zero() {
+        answered as f64 / run_duration.as_seconds_f64()
+    } else {
+        0.0
     };
     let full_timings: Vec<_> = output_timings
         .iter()
@@ -329,6 +323,7 @@ fn compute_timings(
         count,
         missing,
         correct,
+        wrong,
         timings: full_timings,
         throughput,
         latency_mean,
@@ -371,6 +366,8 @@ struct Session {
     logs: ResultLog,
     /// Which indices are query events (need a response).
     query_indices: HashSet<usize>,
+    /// When the first input event was handed out; start of the measured run.
+    start_time: OnceLock<OffsetDateTime>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -388,6 +385,7 @@ pub struct TimingReport {
     pub count: usize,
     pub missing: usize,
     pub correct: usize,
+    pub wrong: usize,
     pub timings: Vec<Option<Duration>>,
     pub throughput: f64,
     pub latency_mean: Duration,
@@ -525,11 +523,38 @@ mod tests {
         let q = report.tracks.get("t").unwrap();
         // Transactions are not logged, so they are not "missing"; only request 1 is
         assert_eq!(q.missing, 1);
+        // The dummy answer differs from the expected output.
+        assert_eq!((q.correct, q.wrong), (0, 1));
         assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 1);
         assert_eq!(q.count, 2);
         // Mean and p99 are over the single answered request, not all requests.
         assert_ne!(q.latency_p99, Duration::ZERO);
         assert_eq!(q.latency_mean, q.latency_max);
+    }
+
+    #[test]
+    fn unfetched_requests_count_as_missing() {
+        let (_dir, ctx) = temp_ctx();
+        let bench_id = new_bench(&ctx, 3);
+        ctx.set_input(0, b"2025-01-01T00:00:01Z,,,,tx1,,").unwrap();
+        ctx.set_input(1, b"2025-01-01T00:00:05Z,0,BALANCE,address=A,,,")
+            .unwrap();
+        ctx.set_input(2, b"2025-01-01T00:00:06Z,1,BALANCE,address=A,,,")
+            .unwrap();
+        setup_track(&ctx, &[0, 1]);
+
+        // The client stops after request 0: request 1 is never handed out.
+        ctx.next_batch(&bench_id).unwrap();
+        ctx.next_batch(&bench_id).unwrap();
+        ctx.result(&bench_id, 0, "2025-01-01T00:00:00Z,0,BALANCE,x".into())
+            .unwrap();
+
+        let report = ctx.complete(&bench_id).unwrap();
+        // Counts are requests, not events (the transaction is not counted).
+        assert_eq!((report.timings.count, report.timings.missing), (2, 1));
+        let q = &report.tracks["t"];
+        assert_eq!((q.count, q.missing), (2, 1));
+        assert!(q.throughput > 0.0);
     }
 
     #[test]
@@ -621,7 +646,7 @@ mod tests {
 
         let report = ctx.complete(&bench_id).unwrap();
         let q = report.tracks.get("t").unwrap();
-        assert_eq!(q.correct, 1);
+        assert_eq!((q.correct, q.wrong), (1, 0));
         assert_eq!(q.missing, 0);
     }
 
