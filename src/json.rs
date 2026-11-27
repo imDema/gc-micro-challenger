@@ -9,7 +9,7 @@ use axum::{
 use serde::Serialize;
 use time::format_description::well_known::Iso8601;
 
-use crate::{BenchConfig, Context, TimingReport, Report, types::QueryId};
+use crate::{BenchConfig, Context, Report, TimingReport};
 
 pub fn router(ctx: Context) -> Router {
     Router::new()
@@ -151,9 +151,7 @@ async fn result(
         )
     })?;
 
-    let r = ctx
-        .result(&id, batch_id, output_csv)
-        .map_err(server_err)?;
+    let r = ctx.result(&id, batch_id, output_csv).map_err(server_err)?;
     Ok(axum::Json(ResultResponse {
         timestamp: r.and_then(|ts| ts.format(&Iso8601::DEFAULT).ok()),
     }))

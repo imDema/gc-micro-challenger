@@ -1,6 +1,6 @@
 default: all
 
-PROFILE := "dev"
+PROFILE := "release"
 TARGET_DIR := if PROFILE == "dev" { "debug" } else { PROFILE }
 
 # Load CSV data into a fresh sled database

@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use log::ResultLog;
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
-use types::{BenchConfig, QueryId};
+use types::BenchConfig;
 
 pub mod cli;
 pub mod html;
@@ -76,7 +76,6 @@ impl Context {
             end: max,
             logs,
             query_indices: Default::default(),
-            batch_size: config.batch_size.map(|s| s.clamp(1, 32 << 10)).unwrap_or(1),
         };
 
         self.sessions.insert(uuid.clone(), session);
@@ -139,13 +138,10 @@ impl Context {
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?
             .1;
 
+        let end = session.end;
         let mappings =
             get_meta::<HashMap<String, String>>(&self.sled, REQ_MAPPING_KEY)?.unwrap_or_default();
-
-        tracing::info!("loaded mappings: {mappings:?}");
-
-        let output_log = session.logs;
-        let output_timings = output_log.to_completed_vec();
+        let output_timings = session.logs.to_completed_vec();
 
         let result_tree = self.sled.open_tree(RESULT)?;
         for (i, result) in output_timings.iter().enumerate() {
@@ -172,24 +168,27 @@ impl Context {
                 .collect(),
         )?;
 
-        // Group requests by track (mapping: request type -> track name).
-        let mut by_track: HashMap<String, Vec<(usize, Option<&log::CompleteResult>)>> =
-            HashMap::new();
-        for (i, r) in output_timings.iter().enumerate() {
-            let Some(row) = r else { continue };
-            let track = extract_request_type(&row.data).and_then(|t| mappings.get(&t));
-            if let Some(track) = track {
-                by_track
-                    .entry(track.clone())
-                    .or_default()
-                    .push((i, r.as_ref()));
+        // Group every request in the input by track (mapping: request type -> track), so
+        // unanswered requests are included too. Rows are batches of newline-separated lines.
+        let mut by_track: HashMap<&String, Vec<_>> = HashMap::new();
+        if !mappings.is_empty() {
+            let range = input_key(0).as_ref().to_vec()..input_key(end).as_ref().to_vec();
+            for batch in self.sled.open_tree(INPUT)?.range(range).values() {
+                for line in batch?.split(|&b| b == b'\n') {
+                    let id = csv_col(line, COL_EVENT_ID).and_then(|c| c.parse::<usize>().ok());
+                    let track = csv_col(line, COL_EVENT_TYPE).and_then(|t| mappings.get(t));
+                    if let (Some(id), Some(track)) = (id, track) {
+                        let answer = output_timings.get(id).and_then(Option::as_ref);
+                        by_track.entry(track).or_default().push((id, answer));
+                    }
+                }
             }
         }
         let mut tracks = HashMap::new();
         for (track, reqs) in by_track {
             // Only report tracks with at least one answered request.
-            if reqs.iter().any(|(_, r)| r.is_some()) {
-                tracks.insert(track, compute_timings(&self.sled, bench_id, reqs)?);
+            if reqs.iter().any(|(_, a)| a.is_some()) {
+                tracks.insert(track.clone(), compute_timings(&self.sled, bench_id, reqs)?);
             }
         }
 
@@ -286,15 +285,16 @@ fn compute_timings(
         .map(|r| r.end - r.start)
         .collect();
     latencies.sort_unstable();
-    let latency_mean = if count > 0 {
-        latencies.iter().sum::<time::Duration>() / count as f64
+    let answered = latencies.len();
+    let latency_mean = if answered > 0 {
+        latencies.iter().sum::<time::Duration>() / answered as f64
     } else {
         time::Duration::ZERO
     };
     let latency_min = latencies.first().cloned().unwrap_or_default();
     let latency_max = latencies.last().cloned().unwrap_or_default();
     let latency_p99 = latencies
-        .get((count as f64 * 0.99).ceil() as usize)
+        .get(((answered as f64 * 0.99).ceil() as usize).saturating_sub(1))
         .cloned()
         .unwrap_or_default();
     let min_t = output_timings
@@ -311,7 +311,11 @@ fn compute_timings(
         Some((min, max)) => {
             let d = max - min;
             let secs = d.as_seconds_f64();
-            if secs > 0.0 { count as f64 / secs } else { 0.0 }
+            if secs > 0.0 {
+                answered as f64 / secs
+            } else {
+                0.0
+            }
         }
         None => 0.0,
     };
@@ -334,12 +338,12 @@ fn compute_timings(
     })
 }
 
-fn extract_request_type(row: &[u8]) -> Option<String> {
-    str::from_utf8(row)
+fn csv_col(line: &[u8], col: usize) -> Option<&str> {
+    str::from_utf8(line)
         .ok()?
         .split(',')
-        .nth(COL_EVENT_TYPE)
-        .map(|t| t.trim().to_owned())
+        .nth(col)
+        .map(str::trim)
 }
 
 pub(crate) fn set_meta<T: Serialize>(sled: &sled::Db, key: &str, value: T) -> Result<(), Error> {
@@ -367,7 +371,6 @@ struct Session {
     logs: ResultLog,
     /// Which indices are query events (need a response).
     query_indices: HashSet<usize>,
-    batch_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -435,6 +438,23 @@ mod tests {
         .unwrap()
     }
 
+    /// Maps BALANCE requests to track "t" and stores expected outputs for `ids`.
+    fn setup_track(ctx: &Context, ids: &[u32]) {
+        set_meta(
+            &ctx.sled,
+            REQ_MAPPING_KEY,
+            HashMap::from([("BALANCE", "t")]),
+        )
+        .unwrap();
+        for &id in ids {
+            ctx.set_output(
+                id,
+                format!("2025-01-01T00:00:00Z,{id},BALANCE,x").as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
     // --- ResultLog tests ---
 
     #[test]
@@ -493,6 +513,7 @@ mod tests {
         ctx.set_input(3, b"2025-01-01T00:00:06Z,1,BALANCE,address=A,,,")
             .unwrap();
 
+        setup_track(&ctx, &[0, 1]);
         for _ in 0..4 {
             ctx.next_batch(&bench_id).unwrap();
         }
@@ -501,11 +522,14 @@ mod tests {
             .unwrap();
 
         let report = ctx.complete(&bench_id).unwrap();
-        let q = report.tracks.get(&0).unwrap();
+        let q = report.tracks.get("t").unwrap();
         // Transactions are not logged, so they are not "missing"; only request 1 is
         assert_eq!(q.missing, 1);
         assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 1);
-        assert_eq!(q.count, 1);
+        assert_eq!(q.count, 2);
+        // Mean and p99 are over the single answered request, not all requests.
+        assert_ne!(q.latency_p99, Duration::ZERO);
+        assert_eq!(q.latency_mean, q.latency_max);
     }
 
     #[test]
@@ -524,6 +548,7 @@ mod tests {
             ctx.set_input(i as u32, line.as_bytes()).unwrap();
         }
 
+        setup_track(&ctx, &[0, 1]);
         let mut query_responses = 0;
         for _ in 0..5 {
             let line = ctx.next_batch(&bench_id).unwrap().unwrap();
@@ -537,7 +562,7 @@ mod tests {
         assert_eq!(query_responses, 2);
 
         let report = ctx.complete(&bench_id).unwrap();
-        let q = report.tracks.get(&0).unwrap();
+        let q = report.tracks.get("t").unwrap();
         assert_eq!(q.missing, 0);
         assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 2);
         assert_eq!(q.count, 2);
@@ -560,6 +585,7 @@ mod tests {
         }
 
         // Process all 4 events, respond only to query at index 1
+        setup_track(&ctx, &[0, 1]);
         for _ in 0..4 {
             ctx.next_batch(&bench_id).unwrap();
         }
@@ -571,7 +597,7 @@ mod tests {
         .unwrap();
 
         let report = ctx.complete(&bench_id).unwrap();
-        let q = report.tracks.get(&0).unwrap();
+        let q = report.tracks.get("t").unwrap();
         // 1 completed query (index 1), 1 query without response (index 3)
         assert_eq!(q.missing, 1);
         assert_eq!(q.timings.iter().filter(|t| t.is_some()).count(), 1);
@@ -585,20 +611,16 @@ mod tests {
         ctx.set_input(0, b"2025-01-01T00:00:01Z,,,,tx1,,").unwrap();
         ctx.set_input(1, b"2025-01-01T00:00:05Z,0,BALANCE,address=A,,,")
             .unwrap();
-        ctx.set_output(0, b"unused").unwrap(); // not a query key, must be ignored
-        ctx.sled
-            .open_tree(OUTPUT)
-            .unwrap()
-            .insert(result_key(&bench_id, 0), b"expected")
-            .unwrap();
+        setup_track(&ctx, &[0]);
 
         for _ in 0..2 {
             ctx.next_batch(&bench_id).unwrap();
         }
-        ctx.result(&bench_id, 0, "expected".into()).unwrap();
+        ctx.result(&bench_id, 0, "2025-01-01T00:00:00Z,0,BALANCE,x".into())
+            .unwrap();
 
         let report = ctx.complete(&bench_id).unwrap();
-        let q = report.tracks.get(&0).unwrap();
+        let q = report.tracks.get("t").unwrap();
         assert_eq!(q.correct, 1);
         assert_eq!(q.missing, 0);
     }

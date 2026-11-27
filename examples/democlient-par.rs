@@ -47,8 +47,7 @@ async fn process_batch(client: Client, url: &str, id: &str, i: usize) -> eyre::R
             let event_time = line.split(',').nth(0).unwrap().trim();
             let request_id = line.split(',').nth(1).unwrap().trim();
             let request_type = line.split(',').nth(2).unwrap().trim();
-            let output_line =
-                format!("{event_time},{request_id},{request_type},dummy:response;");
+            let output_line = format!("{event_time},{request_id},{request_type},dummy:response;");
 
             client
                 .post(format!("{url}/api/result/{id}/{request_id}"))

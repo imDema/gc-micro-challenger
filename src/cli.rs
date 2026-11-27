@@ -51,16 +51,21 @@ pub fn load_csv(
             .nth(COL_EVENT_ID)
             .and_then(|p| p.parse::<usize>().ok())
             .is_some();
-        batch.push(l.clone());
 
-        let flush = is_query || batch.len() as u32 >= max_batch_size;
+        let flush = !batch.is_empty() && (is_query || batch.len() as u32 >= max_batch_size);
         if flush {
-            // for line in batch.drain(..) {
             input_tree.insert(input_key(idx), batch.join("\n").as_bytes())?;
             batch.clear();
             tracing::debug!("loaded input event {}", idx);
             idx += 1;
-            // }
+        }
+
+        if is_query {
+            input_tree.insert(input_key(idx), l.as_bytes())?;
+            tracing::debug!("loaded input event {}", idx);
+            idx += 1;
+        } else {
+            batch.push(l.clone());
         }
     }
 
@@ -68,13 +73,6 @@ pub fn load_csv(
     batch.clear();
     tracing::debug!("loaded input event {}", idx);
     idx += 1;
-
-    // flush any remaining
-    // for line in batch.drain(..) {
-    //     input_tree.insert(input_key(idx), line.as_bytes())?;
-    //     tracing::debug!("loaded input event {}: {}", idx, line);
-    //     idx += 1;
-    // }
 
     let input_len = idx;
 
