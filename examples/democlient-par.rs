@@ -20,7 +20,7 @@ async fn process_batch(client: Client, url: &str, id: &str, i: usize) -> eyre::R
         .await?
         .error_for_status();
 
-    let line = match resp {
+    let batch = match resp {
         Ok(r) => r.text().await?,
         Err(e) if e.status() == Some(StatusCode::NOT_FOUND) => {
             tracing::info!("Next batch not found, breaking...");
@@ -29,34 +29,37 @@ async fn process_batch(client: Client, url: &str, id: &str, i: usize) -> eyre::R
         Err(e) => return Err(e.into()),
     };
 
-    // Extract event type from the first CSV field (0 or 1).
-    let is_query = line
-        .split(',')
-        .nth(1) // request_id field
-        .and_then(|f| f.parse::<u64>().ok())
-        .is_some();
-    tracing::debug!("event {i}: query={is_query}");
-    // tracing::debug!("{}", &line[..30.min(line.len())]);
+    // A batch holds several newline-separated input lines.
+    for line in batch.lines().filter(|l| !l.trim().is_empty()) {
+        // Extract event type from the first CSV field (0 or 1).
+        let is_query = line
+            .split(',')
+            .nth(1) // request_id field
+            .and_then(|f| f.parse::<u64>().ok())
+            .is_some();
+        tracing::debug!("event {i}: query={is_query}");
+        // tracing::debug!("{}", &line[..30.min(line.len())]);
 
-    // Only send a result for query events.
-    if is_query {
-        // Build a CSV output line: request_id,event_time,request_type,result
-        // Extract request_id from the input line (5th column, 0-indexed 4).
-        let event_time = line.split(',').nth(0).unwrap().trim();
-        let request_id = line.split(',').nth(1).unwrap().trim();
-        let request_type = line.split(',').nth(2).unwrap().trim();
-        let output_line =
-            format!("{event_time},{request_id},{request_type},dummy:response;");
+        // Only send a result for query events.
+        if is_query {
+            // Build a CSV output line: request_id,event_time,request_type,result
+            // Extract request_id from the input line (5th column, 0-indexed 4).
+            let event_time = line.split(',').nth(0).unwrap().trim();
+            let request_id = line.split(',').nth(1).unwrap().trim();
+            let request_type = line.split(',').nth(2).unwrap().trim();
+            let output_line =
+                format!("{event_time},{request_id},{request_type},dummy:response;");
 
-        client
-            .post(format!("{url}/api/result/{id}/{request_id}"))
-            .body(output_line)
-            .send()
-            .await?
-            .error_for_status()?;
-        tracing::info!("sent result for event {i}");
-    } else {
-        tracing::debug!("event {i} is an input only event, skipping response");
+            client
+                .post(format!("{url}/api/result/{id}/{request_id}"))
+                .body(output_line)
+                .send()
+                .await?
+                .error_for_status()?;
+            tracing::info!("sent result for event {i}");
+        } else {
+            tracing::debug!("event {i} is an input only event, skipping response");
+        }
     }
     Ok(true)
 }

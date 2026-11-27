@@ -13,6 +13,7 @@ pub struct BenchConfig {
     // #[serde(default = "default_queries")]
     // pub queries: Vec<QueryId>,
     pub max_batches: Option<u32>,
+    pub batch_size: Option<usize>,
 }
 
 pub fn default_queries() -> Vec<QueryId> {

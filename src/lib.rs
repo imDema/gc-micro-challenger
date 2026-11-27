@@ -76,6 +76,7 @@ impl Context {
             end: max,
             logs,
             query_indices: Default::default(),
+            batch_size: config.batch_size.map(|s| s.clamp(1, 32 << 10)).unwrap_or(1),
         };
 
         self.sessions.insert(uuid.clone(), session);
@@ -138,16 +139,13 @@ impl Context {
             .ok_or_else(|| Error::InvalidId(bench_id.to_owned()))?
             .1;
 
-        let mappings = get_meta::<HashMap<String, String>>(&self.sled, REQ_MAPPING_KEY)?
-            .unwrap_or_default();
+        let mappings =
+            get_meta::<HashMap<String, String>>(&self.sled, REQ_MAPPING_KEY)?.unwrap_or_default();
 
         tracing::info!("loaded mappings: {mappings:?}");
 
-        std::thread::sleep(std::time::Duration::from_secs(5));
-
         let output_log = session.logs;
         let output_timings = output_log.to_completed_vec();
-
 
         let result_tree = self.sled.open_tree(RESULT)?;
         for (i, result) in output_timings.iter().enumerate() {
@@ -167,16 +165,24 @@ impl Context {
         let timings = compute_timings(
             &self.sled,
             bench_id,
-            output_timings.iter().map(Option::as_ref).enumerate().collect(),
+            output_timings
+                .iter()
+                .map(Option::as_ref)
+                .enumerate()
+                .collect(),
         )?;
 
         // Group requests by track (mapping: request type -> track name).
-        let mut by_track: HashMap<String, Vec<(usize, Option<&log::CompleteResult>)>> = HashMap::new();
+        let mut by_track: HashMap<String, Vec<(usize, Option<&log::CompleteResult>)>> =
+            HashMap::new();
         for (i, r) in output_timings.iter().enumerate() {
             let Some(row) = r else { continue };
             let track = extract_request_type(&row.data).and_then(|t| mappings.get(&t));
             if let Some(track) = track {
-                by_track.entry(track.clone()).or_default().push((i, r.as_ref()));
+                by_track
+                    .entry(track.clone())
+                    .or_default()
+                    .push((i, r.as_ref()));
             }
         }
         let mut tracks = HashMap::new();
@@ -361,6 +367,7 @@ struct Session {
     logs: ResultLog,
     /// Which indices are query events (need a response).
     query_indices: HashSet<usize>,
+    batch_size: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -423,6 +430,7 @@ mod tests {
             name: "test".into(),
             test: true,
             max_batches: Some(max_batches),
+            batch_size: None,
         })
         .unwrap()
     }

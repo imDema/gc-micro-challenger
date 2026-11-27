@@ -55,19 +55,26 @@ pub fn load_csv(
 
         let flush = is_query || batch.len() as u32 >= max_batch_size;
         if flush {
-            for line in batch.drain(..) {
-                input_tree.insert(input_key(idx), line.as_bytes())?;
-                tracing::debug!("loaded input event {}: {}", idx, line);
-                idx += 1;
-            }
+            // for line in batch.drain(..) {
+            input_tree.insert(input_key(idx), batch.join("\n").as_bytes())?;
+            batch.clear();
+            tracing::debug!("loaded input event {}", idx);
+            idx += 1;
+            // }
         }
     }
+
+    input_tree.insert(input_key(idx), batch.join("\n").as_bytes())?;
+    batch.clear();
+    tracing::debug!("loaded input event {}", idx);
+    idx += 1;
+
     // flush any remaining
-    for line in batch.drain(..) {
-        input_tree.insert(input_key(idx), line.as_bytes())?;
-        tracing::debug!("loaded input event {}: {}", idx, line);
-        idx += 1;
-    }
+    // for line in batch.drain(..) {
+    //     input_tree.insert(input_key(idx), line.as_bytes())?;
+    //     tracing::debug!("loaded input event {}: {}", idx, line);
+    //     idx += 1;
+    // }
 
     let input_len = idx;
 
@@ -114,8 +121,9 @@ pub fn load_csv(
 pub fn load_request_mapping(sled: &Path, json: &Path) -> eyre::Result<()> {
     let db = sled::open(sled)?;
     let mut input_file = BufReader::new(File::open(json)?);
-    let map: std::collections::HashMap<String, String> = serde_json::from_reader(&mut input_file)
-        .wrap_err("Invalid format for request mapping, expected string->string map.")?;
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_reader(&mut input_file)
+            .wrap_err("Invalid format for request mapping, expected string->string map.")?;
 
     set_meta(&db, REQ_MAPPING_KEY, &map)?;
 
